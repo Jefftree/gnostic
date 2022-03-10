@@ -3995,7 +3995,9 @@ type Reference struct {
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
-	XRef string `protobuf:"bytes,1,opt,name=_ref,json=Ref,proto3" json:"_ref,omitempty"`
+	XRef        string `protobuf:"bytes,1,opt,name=_ref,json=Ref,proto3" json:"_ref,omitempty"`
+	Summary     string `protobuf:"bytes,2,opt,name=summary,json=summary,proto3" json:"summary,omitempty"`
+	Description string `protobuf:"bytes,3,opt,name=description,json=description,proto3" json:"description,omitempty"`
 }
 
 func (x *Reference) Reset() {
