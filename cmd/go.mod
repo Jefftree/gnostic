@@ -1,4 +1,4 @@
-module github.com/google/gnostic/cmd
+module github.com/jefftree/google/gnostic/cmd
 
 go 1.12
 
