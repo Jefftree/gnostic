@@ -102,8 +102,9 @@ func (domain *Domain) GenerateCompiler(packageName string, license string, impor
 	}
 
 	// generate ResolveReferences() methods for each type
+	cycleTypes := domain.resolveReferencesCycleTypes(typeNames)
 	for _, typeName := range typeNames {
-		domain.generateResolveReferencesMethodsForType(code, typeName)
+		domain.generateResolveReferencesMethodsForType(code, typeName, cycleTypes)
 	}
 
 	// generate ToRawInfo() methods for each type
@@ -596,11 +597,93 @@ func (domain *Domain) generateConstructorForType(code *printer.Code, typeName st
 	code.Print("}\n")
 }
 
+func (domain *Domain) resolveReferencesCycleTypes(typeNames []string) map[string]bool {
+	fwd := make(map[string][]string, len(typeNames))
+	rev := make(map[string][]string, len(typeNames))
+	addEdge := func(from, to string) {
+		fwd[from] = append(fwd[from], to)
+		rev[to] = append(rev[to], from)
+	}
+
+	cycleTypes := make(map[string]bool)
+	var refReplacing []string
+
+	for _, typeName := range typeNames {
+		typeModel := domain.TypeModels[typeName]
+		if typeModel.OneOfWrapper {
+			for _, propertyModel := range typeModel.Properties {
+				if _, ok := domain.TypeModels[propertyModel.Type]; ok {
+					addEdge(typeName, propertyModel.Type)
+				}
+			}
+			continue
+		}
+		for _, propertyModel := range typeModel.Properties {
+			if propertyModel.Name == "$ref" {
+				cycleTypes[typeName] = true
+				if len(typeModel.Properties) > 1 {
+					refReplacing = append(refReplacing, typeName)
+					addEdge(typeName, typeName)
+				}
+			}
+			if !propertyModel.Repeated {
+				if tm, ok := domain.TypeModels[propertyModel.Type]; ok && !tm.IsPair {
+					addEdge(typeName, propertyModel.Type)
+				}
+			} else {
+				if _, ok := domain.TypeModels[propertyModel.Type]; ok {
+					addEdge(typeName, propertyModel.Type)
+				}
+			}
+		}
+	}
+
+	reachable := func(start string, adj map[string][]string) map[string]bool {
+		vis := map[string]bool{start: true}
+		queue := []string{start}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			for _, next := range adj[cur] {
+				if !vis[next] {
+					vis[next] = true
+					queue = append(queue, next)
+				}
+			}
+		}
+		return vis
+	}
+
+	for _, r := range refReplacing {
+		fromR := reachable(r, fwd)
+		toR := reachable(r, rev)
+		for _, t := range typeNames {
+			if fromR[t] && toR[t] {
+				cycleTypes[t] = true
+			}
+		}
+	}
+	return cycleTypes
+}
+
 // ResolveReferences() methods
-func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code, typeName string) {
+func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code, typeName string, cycleTypes map[string]bool) {
+	inCycle := cycleTypes[typeName]
 	code.Print("// ResolveReferences resolves references found inside %s objects.", typeName)
 	code.Print("func (m *%s) ResolveReferences(root string) (*yaml.Node, error) {", typeName)
+	if inCycle {
+		code.Print("	return m.resolveReferences(root, make(map[string]bool))")
+		code.Print("}\n")
+		code.Print("func (m *%s) resolveReferences(root string, seen map[string]bool) (*yaml.Node, error) {", typeName)
+	}
 	code.Print("errors := make([]error, 0)")
+
+	callExpr := func(targetType string) string {
+		if inCycle && cycleTypes[targetType] {
+			return "resolveReferences(root, seen)"
+		}
+		return "ResolveReferences(root)"
+	}
 
 	typeModel := domain.TypeModels[typeName]
 	if typeModel.OneOfWrapper {
@@ -613,7 +696,7 @@ func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code
 				code.Print("p, ok := m.Oneof.(*%s_%s)", typeName, propertyType)
 				code.Print("if ok {")
 				if propertyType == "JsonReference" { // Special case for OpenAPI
-					code.Print("info, err := p.%s.ResolveReferences(root)", propertyType)
+					code.Print("info, err := p.%s.%s", propertyType, callExpr(propertyType))
 					code.Print("if err != nil {")
 					code.Print("  return nil, err")
 					code.Print("} else if info != nil {")
@@ -626,7 +709,7 @@ func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code
 					code.Print("  }")
 					code.Print("}")
 				} else {
-					code.Print("_, err := p.%s.ResolveReferences(root)", propertyType)
+					code.Print("_, err := p.%s.%s", propertyType, callExpr(propertyType))
 					code.Print("if err != nil {")
 					code.Print("	return nil, err")
 					code.Print("}")
@@ -651,6 +734,12 @@ func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code
 			if propertyName == "$ref" {
 				fieldName = "XRef"
 				code.Print("if m.XRef != \"\" {")
+				code.Print("ref := m.XRef")
+				code.Print("if seen[ref] {")
+				code.Print("	return nil, compiler.NewError(nil, fmt.Sprintf(\"circular $ref: %%s\", ref))")
+				code.Print("}")
+				code.Print("seen[ref] = true")
+				code.Print("defer delete(seen, ref)")
 				//code.Print("log.Printf(\"%s reference to resolve %%+v\", m.XRef)", typeName)
 				code.Print("info, err := compiler.ReadInfoForRef(root, m.XRef)")
 
@@ -664,7 +753,7 @@ func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code
 					code.Print("  replacement, err := New%s(info, nil)", typeName)
 					code.Print("  if err == nil {")
 					code.Print("    *m = *replacement")
-					code.Print("    return m.ResolveReferences(root)")
+					code.Print("    return m.resolveReferences(root, seen)")
 					code.Print("  }")
 					code.Print("}")
 				}
@@ -678,7 +767,7 @@ func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code
 				typeModel, typeFound := domain.TypeModels[propertyType]
 				if typeFound && !typeModel.IsPair {
 					code.Print("if m.%s != nil {", fieldName)
-					code.Print("    _, err := m.%s.ResolveReferences(root)", fieldName)
+					code.Print("    _, err := m.%s.%s", fieldName, callExpr(propertyType))
 					code.Print("    if err != nil {")
 					code.Print("       errors = append(errors, err)")
 					code.Print("    }")
@@ -690,7 +779,7 @@ func (domain *Domain) generateResolveReferencesMethodsForType(code *printer.Code
 				if typeFound {
 					code.Print("for _, item := range m.%s {", fieldName)
 					code.Print("if item != nil {")
-					code.Print("  _, err := item.ResolveReferences(root)")
+					code.Print("  _, err := item.%s", callExpr(propertyType))
 					code.Print("  if err != nil {")
 					code.Print("     errors = append(errors, err)")
 					code.Print("  }")
